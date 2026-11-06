@@ -1,0 +1,13 @@
+name = "doubleearnbot"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taskbot"
+database_id = "5b9b401f-ceec-4918-abec-b887514cb93f"
+
+[vars]
+ADMIN_ID = "LAMBAR_ID_DINKI"
+CHANNELS = "@Channel1,@Channel2"
+MIN_WITHDRAW = "50"
