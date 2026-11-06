@@ -3,7 +3,13 @@
 // Variables: ADMIN_ID, CHANNELS (e.g. @channel1,@channel2), MIN_WITHDRAW (optional).
 
 const WELCOME_BONUS = 50;
-const REFERRAL_BONUS = 20;
+// Referral bonus comes from the REFERRAL_BONUS variable (set it to 0 to turn referral rewards off).
+function referralBonus(env) {
+  const raw = env.REFERRAL_BONUS;
+  if (raw === undefined || String(raw).trim() === '') return 20;
+  const v = Number(raw);
+  return Number.isInteger(v) && v >= 0 ? v : 20;
+}
 const UNLOCK_EARNINGS = 100;
 const STATE_TTL_SEC = 3600;
 const JOIN_CACHE_MS = 15000;
@@ -278,12 +284,13 @@ async function grantWelcome(env, user) {
     const r = await q1(env, 'SELECT telegram_id FROM users WHERE id = ?', user.referred_by);
     if (r) referrerTg = r.telegram_id;
   }
+  const bonus = referralBonus(env);
   // One atomic batch. Every statement is guarded by "welcome_given = 0", so it runs once per user.
   const res = await env.DB.batch([
-    st(env, `UPDATE users SET balance = balance + ? WHERE id = (SELECT referred_by FROM users WHERE id = ? AND welcome_given = 0)`, REFERRAL_BONUS, user.id),
+    st(env, `UPDATE users SET balance = balance + ? WHERE id = (SELECT referred_by FROM users WHERE id = ? AND welcome_given = 0)`, bonus, user.id),
     st(env, `INSERT INTO history (user_id, type, description, status, points)
              SELECT referred_by, 'referral', 'Referral Bonus', 'approved', ? FROM users
-             WHERE id = ? AND welcome_given = 0 AND referred_by IS NOT NULL`, REFERRAL_BONUS, user.id),
+             WHERE id = ? AND welcome_given = 0 AND referred_by IS NOT NULL AND ? > 0`, bonus, user.id, bonus),
     st(env, `INSERT INTO history (user_id, type, description, status, points)
              SELECT id, 'bonus', 'Welcome Bonus (Non-withdrawable)', 'approved', ? FROM users
              WHERE id = ? AND welcome_given = 0`, WELCOME_BONUS, user.id),
@@ -292,8 +299,8 @@ async function grantWelcome(env, user) {
   if (res[3].meta.changes !== 1) return;
   user.balance += WELCOME_BONUS;
   user.welcome_given = 1;
-  if (referrerTg) {
-    await safeSend(env, referrerTg, `🎉 You got ${REFERRAL_BONUS} points! Your referral ${nameOf(user)} joined the channels.`);
+  if (referrerTg && bonus > 0) {
+    await safeSend(env, referrerTg, `🎉 You got ${bonus} points! Your referral ${nameOf(user)} joined the channels.`);
   }
   await send(env, user.telegram_id, `🎁 Welcome Bonus: ${WELCOME_BONUS} Points added! (You must earn ${UNLOCK_EARNINGS} points from tasks before you can withdraw)`);
 }
@@ -403,12 +410,16 @@ async function hHistory(env, user) {
 }
 
 async function hReferral(env, user, botUsername) {
+  const bonus = referralBonus(env);
   const r = await q1(env, 'SELECT COUNT(*) AS n FROM users WHERE referred_by = ? AND welcome_given = 1', user.id);
   await send(
     env,
     user.telegram_id,
     `👥 Your Referral Link:\nhttps://t.me/${botUsername}?start=${user.telegram_id}\n\n` +
-      `Total Referrals: ${r.n}\nBonus: ${REFERRAL_BONUS} Points per referral who joins the channels\n\nShare it to earn!`
+      `Total Referrals: ${r.n}\n` +
+      (bonus > 0
+        ? `Bonus: ${bonus} Points per referral who joins the channels\n\nShare it to earn!`
+        : 'Referral rewards are currently paused.')
   );
 }
 
