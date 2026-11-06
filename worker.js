@@ -742,13 +742,19 @@ async function handle(env, update) {
 }
 
 async function setup(env, url) {
-  if (!env.WEBHOOK_SECRET || url.searchParams.get('key') !== env.WEBHOOK_SECRET) {
-    return new Response('Forbidden', { status: 403 });
+  const secret = (env.WEBHOOK_SECRET || '').trim();
+  if (!secret) {
+    return new Response('Forbidden: WEBHOOK_SECRET is missing on this Worker. Add it under Settings > Variables and Secrets (the runtime one, not Build), then deploy.', { status: 403 });
   }
+  if (url.searchParams.get('key') !== secret) {
+    return new Response('Forbidden: the key in the address does not match WEBHOOK_SECRET.', { status: 403 });
+  }
+  if (!env.BOT_TOKEN) return new Response('BOT_TOKEN is missing on this Worker.', { status: 500 });
+  if (!env.DB) return new Response('The D1 binding named DB is missing on this Worker.', { status: 500 });
   await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
   const result = await tg(env, 'setWebhook', {
     url: `${url.origin}/webhook`,
-    secret_token: env.WEBHOOK_SECRET,
+    secret_token: secret,
     allowed_updates: ['message', 'callback_query'],
     drop_pending_updates: true,
   });
@@ -766,7 +772,7 @@ export default {
       }
     }
     if (url.pathname === '/webhook' && request.method === 'POST') {
-      if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
+      if (request.headers.get('X-Telegram-Bot-Api-Secret-Token') !== (env.WEBHOOK_SECRET || '').trim()) {
         return new Response('Forbidden', { status: 403 });
       }
       const update = await request.json();
