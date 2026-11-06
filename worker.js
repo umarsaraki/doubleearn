@@ -96,7 +96,10 @@ const COUNTRIES = {
 
 // ---------- Small helpers ----------
 const cfgOf = (env) => ({
-  admin: Number(env.ADMIN_ID),
+  admins: (env.ADMIN_IDS || env.ADMIN_ID || '')
+    .split(',')
+    .map((x) => Number(x.trim()))
+    .filter(Boolean),
   channels: (env.CHANNELS || '')
     .split(',')
     .map((s) => s.trim())
@@ -140,6 +143,26 @@ const send = (env, chatId, text, markup) =>
 
 const safeSend = (env, chatId, text) =>
   send(env, chatId, text).catch((e) => console.error(`Could not message ${chatId}: ${e.message}`));
+
+// Several admins can be set: ADMIN_ID = "111,222,333,444". Requests go to all of them.
+async function sendToAdmins(env, text, markup) {
+  for (const id of cfgOf(env).admins) {
+    await send(env, id, text, markup).catch((e) => console.error(`Could not message admin ${id}: ${e.message}`));
+  }
+}
+
+async function photoToAdmins(env, params) {
+  let delivered = 0;
+  for (const id of cfgOf(env).admins) {
+    try {
+      await tg(env, 'sendPhoto', { ...params, chat_id: id });
+      delivered++;
+    } catch (e) {
+      console.error(`Could not send photo to admin ${id}: ${e.message}`);
+    }
+  }
+  if (!delivered) throw new Error('No admin could be reached');
+}
 
 // D1 helpers
 const q1 = (env, sql, ...p) => env.DB.prepare(sql).bind(...p).first();
@@ -478,9 +501,8 @@ async function doWithdraw(env, user, text) {
   const w = await q1(env, 'SELECT id FROM withdrawals WHERE req = ?', req);
   const fresh = await q1(env, 'SELECT balance FROM users WHERE id = ?', user.id);
   await send(env, user.telegram_id, `✅ Withdrawal request sent: ${cur} ${points}\nRemaining balance: ${fresh.balance} points`, MENU);
-  await send(
+  await sendToAdmins(
     env,
-    cfg.admin,
     `💸 Withdrawal Request #${w.id}\nUser: ${nameOf(user)} (${user.country})\nID: ${user.telegram_id}\nPoints: ${points}\n` +
       `Amount: ${cur} ${points}\nMethod: ${user.payment_type}\nDetails: ${user.payment_details}`,
     ik([[cb('✅ Paid', `paid_${w.id}`), cb('↩️ Reject & Refund', `wreject_${w.id}`)]])
@@ -517,8 +539,7 @@ async function onPhoto(env, m) {
   const utId = res[0].meta.last_row_id;
 
   try {
-    await tg(env, 'sendPhoto', {
-      chat_id: cfgOf(env).admin,
+    await photoToAdmins(env, {
       photo: fileId,
       caption: `User ${nameOf(user)} (${user.country})\nID: ${user.telegram_id}\nTask ID: ${taskId}\nUsername: ${caption}\nUT_ID: ${utId}`,
       reply_markup: ik([[cb('✅ Approve', `approve_${utId}`), cb('❌ Reject', `reject_${utId}`)]]),
@@ -536,7 +557,7 @@ async function onPhoto(env, m) {
 }
 
 async function onAddTask(env, m, text) {
-  if (m.from.id !== cfgOf(env).admin) return;
+  if (!cfgOf(env).admins.includes(m.from.id)) return;
   const parts = text.replace(/^\/addtask(@\w+)?\s*/i, '').split('|').map((p) => p.trim());
   const points = Number(parts[3]);
   if (parts.length < 4 || !parts[0] || !Number.isInteger(points) || points <= 0) {
@@ -557,7 +578,7 @@ async function onCallback(env, cq) {
 
   // Admin actions
   if (/^(approve|reject|paid|wreject)_\d+$/.test(data)) {
-    if (from.id !== cfg.admin) return ack('Not allowed', true);
+    if (!cfg.admins.includes(from.id)) return ack('Not allowed', true);
     const [action, id] = data.split('_');
     if (action === 'approve') return approveTask(env, cq, Number(id), ack);
     if (action === 'reject') return rejectTask(env, cq, Number(id), ack);
