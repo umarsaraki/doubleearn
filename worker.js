@@ -2,15 +2,39 @@
 // Bindings: DB (D1). Secrets: BOT_TOKEN, WEBHOOK_SECRET.
 // Variables: ADMIN_ID, CHANNELS (e.g. @channel1,@channel2), MIN_WITHDRAW (optional).
 
-const WELCOME_BONUS = 50;
-// Referral bonus comes from the REFERRAL_BONUS variable (set it to 0 to turn referral rewards off).
-function referralBonus(env) {
-  const raw = env.REFERRAL_BONUS;
-  if (raw === undefined || String(raw).trim() === '') return 20;
-  const v = Number(raw);
-  return Number.isInteger(v) && v >= 0 ? v : 20;
+const DEFAULT_SETTINGS = { welcome: 50, referral: 20, unlock: 100, minWithdraw: 50 };
+const SETTING_KEYS = { welcome: 'welcome_bonus', referral: 'referral_bonus', unlock: 'unlock_earnings', minWithdraw: 'min_withdraw' };
+let settingsCache = null;
+let settingsAt = 0;
+
+// Admins edit these from Telegram (see /settings). Order: value saved in D1, then the optional
+// REFERRAL_BONUS / MIN_WITHDRAW variables, then the defaults above.
+async function getSettings(env) {
+  if (settingsCache && Date.now() - settingsAt < 10000) return settingsCache;
+  const stored = {};
+  try {
+    const rows = await qa(env, 'SELECT key, value FROM settings');
+    for (const r of rows) stored[r.key] = Number(r.value);
+  } catch (e) {
+    // The settings table is created by /setup.
+  }
+  const fromEnv = (v) => (v !== undefined && String(v).trim() !== '' && Number.isInteger(Number(v)) && Number(v) >= 0 ? Number(v) : null);
+  const pick = (name, envValue) => {
+    const v = stored[SETTING_KEYS[name]];
+    if (Number.isInteger(v) && v >= 0) return v;
+    const e = fromEnv(envValue);
+    return e !== null ? e : DEFAULT_SETTINGS[name];
+  };
+  settingsCache = {
+    welcome: pick('welcome'),
+    referral: pick('referral', env.REFERRAL_BONUS),
+    unlock: pick('unlock'),
+    minWithdraw: Math.max(1, pick('minWithdraw', env.MIN_WITHDRAW)),
+  };
+  settingsAt = Date.now();
+  return settingsCache;
 }
-const UNLOCK_EARNINGS = 100;
+
 const STATE_TTL_SEC = 3600;
 const JOIN_CACHE_MS = 15000;
 const joinCache = new Map();
@@ -26,6 +50,7 @@ const SCHEMA = [
     payment_details TEXT,
     welcome_given INTEGER NOT NULL DEFAULT 0,
     referred_by INTEGER,
+    withdraw_unlocked INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )`,
   `CREATE TABLE IF NOT EXISTS tasks (
@@ -72,12 +97,19 @@ const SCHEMA = [
     data TEXT,
     ts INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  )`,
   `CREATE INDEX IF NOT EXISTS idx_users_balance ON users (balance DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_users_referred ON users (referred_by)`,
   `CREATE INDEX IF NOT EXISTS idx_history_user ON history (user_id, id DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_history_ref ON history (type, ref_id)`,
   `CREATE INDEX IF NOT EXISTS idx_withdrawals_req ON withdrawals (req)`,
 ];
+
+// Applied by /setup for databases created before these columns existed (errors are ignored).
+const MIGRATIONS = [`ALTER TABLE users ADD COLUMN withdraw_unlocked INTEGER NOT NULL DEFAULT 0`];
 
 const COUNTRIES = {
   Nigeria: {
@@ -198,16 +230,16 @@ async function getTaskEarnings(env, userId) {
 }
 
 // ---------- Messages ----------
-const textWelcomeNew = () =>
-  `🎉 Welcome to DoubleEarn!\n\nComplete tasks in Nigeria & Ghana and earn points.\n\nWe pay in NGN & GHS to your Bank/MoMo.\n\nSelect your country to start and get ${WELCOME_BONUS} Points FREE!`;
+const textWelcomeNew = (s) =>
+  `🎉 Welcome to DoubleEarn!\n\nComplete tasks in Nigeria & Ghana and earn points.\n\nWe pay in NGN & GHS to your Bank/MoMo.\n\nSelect your country to start${s.welcome > 0 ? ` and get ${s.welcome} Points FREE` : ''}!`;
 
-const textCountrySelected = (country) => {
+const textCountrySelected = (country, s) => {
   const c = COUNTRIES[country];
   return (
     `${c.flag} Welcome to DoubleEarn ${country}!\n\n` +
     `You selected ${country} - you will earn and withdraw in ${c.currency}.\n` +
     `✅ Complete tasks\n✅ Earn points\n✅ Withdraw to ${c.payoutText}\n\n` +
-    `Now join our channels to get ${WELCOME_BONUS} Points FREE!`
+    (s.welcome > 0 ? `Now join our channels to get ${s.welcome} Points FREE!` : 'Now join our channels to continue.')
   );
 };
 
@@ -279,30 +311,37 @@ async function sendJoinPrompt(env, chatId, missing) {
 
 async function grantWelcome(env, user) {
   if (user.welcome_given) return;
+  const s = await getSettings(env);
   let referrerTg = null;
   if (user.referred_by) {
     const r = await q1(env, 'SELECT telegram_id FROM users WHERE id = ?', user.referred_by);
     if (r) referrerTg = r.telegram_id;
   }
-  const bonus = referralBonus(env);
   // One atomic batch. Every statement is guarded by "welcome_given = 0", so it runs once per user.
   const res = await env.DB.batch([
-    st(env, `UPDATE users SET balance = balance + ? WHERE id = (SELECT referred_by FROM users WHERE id = ? AND welcome_given = 0)`, bonus, user.id),
+    st(env, `UPDATE users SET balance = balance + ? WHERE id = (SELECT referred_by FROM users WHERE id = ? AND welcome_given = 0)`, s.referral, user.id),
     st(env, `INSERT INTO history (user_id, type, description, status, points)
              SELECT referred_by, 'referral', 'Referral Bonus', 'approved', ? FROM users
-             WHERE id = ? AND welcome_given = 0 AND referred_by IS NOT NULL AND ? > 0`, bonus, user.id, bonus),
+             WHERE id = ? AND welcome_given = 0 AND referred_by IS NOT NULL AND ? > 0`, s.referral, user.id, s.referral),
     st(env, `INSERT INTO history (user_id, type, description, status, points)
              SELECT id, 'bonus', 'Welcome Bonus (Non-withdrawable)', 'approved', ? FROM users
-             WHERE id = ? AND welcome_given = 0`, WELCOME_BONUS, user.id),
-    st(env, `UPDATE users SET balance = balance + ?, welcome_given = 1 WHERE id = ? AND welcome_given = 0`, WELCOME_BONUS, user.id),
+             WHERE id = ? AND welcome_given = 0 AND ? > 0`, s.welcome, user.id, s.welcome),
+    st(env, `UPDATE users SET balance = balance + ?, welcome_given = 1 WHERE id = ? AND welcome_given = 0`, s.welcome, user.id),
   ]);
   if (res[3].meta.changes !== 1) return;
-  user.balance += WELCOME_BONUS;
+  user.balance += s.welcome;
   user.welcome_given = 1;
-  if (referrerTg && bonus > 0) {
-    await safeSend(env, referrerTg, `🎉 You got ${bonus} points! Your referral ${nameOf(user)} joined the channels.`);
+  if (referrerTg && s.referral > 0) {
+    await safeSend(env, referrerTg, `🎉 You got ${s.referral} points! Your referral ${nameOf(user)} joined the channels.`);
   }
-  await send(env, user.telegram_id, `🎁 Welcome Bonus: ${WELCOME_BONUS} Points added! (You must earn ${UNLOCK_EARNINGS} points from tasks before you can withdraw)`);
+  if (s.welcome > 0) {
+    await send(
+      env,
+      user.telegram_id,
+      `🎁 Welcome Bonus: ${s.welcome} Points added!` +
+        (s.unlock > 0 ? ` (You must earn ${s.unlock} points from tasks before you can withdraw)` : '')
+    );
+  }
 }
 
 // Runs before every user action: country, channel membership, welcome bonus.
@@ -325,7 +364,7 @@ async function passGate(env, from) {
 async function onStart(env, from, payload) {
   await clearInput(env, from.id);
   const user = await ensureUser(env, from, payload);
-  if (!user.country) return send(env, from.id, textWelcomeNew(), countryKeyboard());
+  if (!user.country) return send(env, from.id, textWelcomeNew(await getSettings(env)), countryKeyboard());
   const ready = await passGate(env, from);
   if (ready) await send(env, from.id, textWelcomeBack(ready.country), MENU);
 }
@@ -335,21 +374,30 @@ async function onCountry(env, from, chosen, cq) {
   if (!user.country) await run(env, 'UPDATE users SET country = ? WHERE id = ? AND country IS NULL', chosen, user.id);
   const fresh = await q1(env, 'SELECT country FROM users WHERE id = ?', user.id);
   await tg(env, 'deleteMessage', { chat_id: cq.message.chat.id, message_id: cq.message.message_id }).catch(() => {});
-  await send(env, from.id, textCountrySelected(fresh.country));
+  await send(env, from.id, textCountrySelected(fresh.country, await getSettings(env)));
   const ready = await passGate(env, from);
   if (ready) await send(env, from.id, textVerified(ready.country), MENU);
 }
 
 // ---------- Menu handlers ----------
-async function hBalance(env, user) {
+// A user can withdraw if an admin unlocked them, or they earned enough points from tasks.
+async function withdrawStatus(env, user, s) {
   const earned = await getTaskEarnings(env, user.id);
-  const unlocked = earned >= UNLOCK_EARNINGS;
+  const unlocked = Number(user.withdraw_unlocked) === 1 || earned >= s.unlock;
+  return { earned, unlocked };
+}
+
+async function hBalance(env, user) {
+  const s = await getSettings(env);
+  const { earned, unlocked } = await withdrawStatus(env, user, s);
   await send(
     env,
     user.telegram_id,
     `Your Balance: ${user.balance} Points = ${currencyOf(user.country)} ${user.balance}\n\n` +
       `Task Earnings: ${earned} Points\n` +
-      `Welcome Bonus: ${WELCOME_BONUS} Points ${unlocked ? '(Unlocked)' : `(Locked until you earn ${UNLOCK_EARNINGS} points from tasks)`}\n\n` +
+      (s.welcome > 0
+        ? `Welcome Bonus: ${s.welcome} Points ${unlocked ? '(Unlocked)' : `(Locked until you earn ${s.unlock} points from tasks)`}\n\n`
+        : '\n') +
       `Withdrawable: ${unlocked ? user.balance : 0} Points`
   );
 }
@@ -376,21 +424,23 @@ async function showPaymentMethod(env, user) {
 
 async function hWithdraw(env, user) {
   if (!user.payment_details) return send(env, user.telegram_id, 'You must add payment method first', paymentKeyboard(user.country));
-  const earned = await getTaskEarnings(env, user.id);
-  if (earned < UNLOCK_EARNINGS) {
+  const s = await getSettings(env);
+  const { earned, unlocked } = await withdrawStatus(env, user, s);
+  if (!unlocked) {
     return send(
       env,
       user.telegram_id,
-      `❌ You cannot withdraw yet!\n\nYou must earn at least ${UNLOCK_EARNINGS} Points from Tasks first.\n` +
-        `Currently earned from tasks: ${earned}/${UNLOCK_EARNINGS} Points\n\n` +
-        `The Welcome Bonus (${WELCOME_BONUS}) cannot be withdrawn until then.\nGo to 📋 Tasks and complete tasks.`
+      `❌ You cannot withdraw yet!\n\nYou must earn at least ${s.unlock} Points from Tasks first.\n` +
+        `Currently earned from tasks: ${earned}/${s.unlock} Points\n\n` +
+        (s.welcome > 0 ? `The Welcome Bonus (${s.welcome}) cannot be withdrawn until then.\n` : '') +
+        `Go to 📋 Tasks and complete tasks.`
     );
   }
   await setState(env, user.telegram_id, 'withdraw', {});
   await send(
     env,
     user.telegram_id,
-    `How many points to withdraw? Minimum: ${cfgOf(env).minWithdraw}\n1 Point = ${currencyOf(user.country)} 1\n\n` +
+    `How many points to withdraw? Minimum: ${s.minWithdraw}\n1 Point = ${currencyOf(user.country)} 1\n\n` +
       `Payout to: ${user.payment_type} - ${user.payment_details}\nWithdrawable Balance: ${user.balance} Points\nYour task earnings: ${earned} Points`
   );
 }
@@ -410,7 +460,7 @@ async function hHistory(env, user) {
 }
 
 async function hReferral(env, user, botUsername) {
-  const bonus = referralBonus(env);
+  const bonus = (await getSettings(env)).referral;
   const r = await q1(env, 'SELECT COUNT(*) AS n FROM users WHERE referred_by = ? AND welcome_given = 1', user.id);
   await send(
     env,
@@ -446,6 +496,7 @@ async function onMessage(env, m) {
 
   if (/^\/start(@\w+)?(\s|$)/i.test(text)) return onStart(env, m.from, text.split(/\s+/)[1] || '');
   if (/^\/addtask(@\w+)?(\s|$)/i.test(text)) return onAddTask(env, m, text);
+  if (text.startsWith('/') && cfgOf(env).admins.includes(m.from.id) && (await onAdminCommand(env, m, text))) return;
 
   const handler = MENU_HANDLERS[text];
   if (handler) {
@@ -478,16 +529,16 @@ async function onText(env, from, text) {
 }
 
 async function doWithdraw(env, user, text) {
-  const cfg = cfgOf(env);
+  const s = await getSettings(env);
   if (!/^\d+$/.test(text)) return send(env, user.telegram_id, 'Please send a whole number. Example: 1000');
   const points = Number(text);
-  if (points < cfg.minWithdraw) return send(env, user.telegram_id, `Minimum withdrawal is ${cfg.minWithdraw} points.`);
+  if (points < s.minWithdraw) return send(env, user.telegram_id, `Minimum withdrawal is ${s.minWithdraw} points.`);
   if (!user.payment_details) return send(env, user.telegram_id, 'You must add payment method first', paymentKeyboard(user.country));
 
-  const earned = await getTaskEarnings(env, user.id);
-  if (earned < UNLOCK_EARNINGS) {
+  const { earned, unlocked } = await withdrawStatus(env, user, s);
+  if (!unlocked) {
     await clearState(env, user.telegram_id);
-    return send(env, user.telegram_id, `❌ You must earn at least ${UNLOCK_EARNINGS} Points from Tasks first (${earned}/${UNLOCK_EARNINGS}).`);
+    return send(env, user.telegram_id, `❌ You must earn at least ${s.unlock} Points from Tasks first (${earned}/${s.unlock}).`);
   }
   if (points > user.balance) return send(env, user.telegram_id, 'Insufficient balance. Send a smaller amount or press a menu button to cancel.');
 
@@ -499,8 +550,8 @@ async function doWithdraw(env, user, text) {
     st(env, `INSERT INTO withdrawals (user_id, points, amount, currency, req)
              SELECT u.id, ?, ?, ?, ? FROM users u
              WHERE u.id = ? AND u.balance >= ?
-               AND (SELECT COALESCE(SUM(points), 0) FROM history WHERE user_id = u.id AND type = 'earn' AND status = 'approved') >= ?`,
-       points, String(points), cur, req, user.id, points, UNLOCK_EARNINGS),
+               AND (u.withdraw_unlocked = 1 OR (SELECT COALESCE(SUM(points), 0) FROM history WHERE user_id = u.id AND type = 'earn' AND status = 'approved') >= ?)`,
+       points, String(points), cur, req, user.id, points, s.unlock),
     st(env, `UPDATE users SET balance = balance - ? WHERE id = ? AND EXISTS (SELECT 1 FROM withdrawals WHERE req = ?)`, points, user.id, req),
     st(env, `INSERT INTO history (user_id, type, description, status, points, ref_id)
              SELECT ?, 'withdraw', ?, 'pending', ?, id FROM withdrawals WHERE req = ?`,
@@ -576,6 +627,113 @@ async function onAddTask(env, m, text) {
   }
   const r = await run(env, 'INSERT INTO tasks (title, description, link, points) VALUES (?, ?, ?, ?)', parts[0], parts[1], parts[2], points);
   await send(env, m.from.id, `✅ Task added. ID: ${r.meta.last_row_id}`);
+}
+
+// ---------- Admin commands ----------
+const ADMIN_HELP =
+  `🛠 Admin commands\n\n` +
+  `/addtask Title | Description | Link | Points\n/tasks - list active tasks\n/deltask ID - delete a task\n\n` +
+  `/settings - show current settings\n/setwelcome N - welcome bonus points\n/setreferral N - referral bonus (0 = off)\n` +
+  `/setunlock N - task points needed before withdrawing (0 = none)\n/setminwithdraw N - minimum withdrawal\n\n` +
+  `/unlock ID or @username - let a user withdraw without doing tasks\n/lock ID or @username - undo that\n/user ID or @username - view a user`;
+
+const SET_COMMANDS = {
+  setwelcome: { key: 'welcome', label: 'Welcome bonus', min: 0 },
+  setreferral: { key: 'referral', label: 'Referral bonus', min: 0 },
+  setunlock: { key: 'unlock', label: 'Task points needed to unlock withdrawals', min: 0 },
+  setminwithdraw: { key: 'minWithdraw', label: 'Minimum withdrawal', min: 1 },
+};
+
+async function findUser(env, arg) {
+  const a = (arg || '').trim();
+  if (!a) return null;
+  if (/^\d+$/.test(a)) return q1(env, 'SELECT * FROM users WHERE telegram_id = ?', Number(a));
+  return q1(env, 'SELECT * FROM users WHERE lower(username) = lower(?)', a.replace(/^@/, ''));
+}
+
+async function onAdminCommand(env, m, text) {
+  const parsed = text.match(/^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
+  if (!parsed) return false;
+  const cmd = parsed[1].toLowerCase();
+  const args = (parsed[2] || '').trim();
+  const reply = (t) => send(env, m.from.id, t);
+
+  if (cmd === 'admin') {
+    await reply(ADMIN_HELP);
+    return true;
+  }
+
+  if (cmd === 'settings') {
+    const s = await getSettings(env);
+    await reply(
+      `⚙️ Current settings\n\nWelcome bonus: ${s.welcome} points\nReferral bonus: ${s.referral} points${s.referral === 0 ? ' (off)' : ''}\n` +
+        `Task points needed before withdrawing: ${s.unlock}${s.unlock === 0 ? ' (no requirement)' : ''}\nMinimum withdrawal: ${s.minWithdraw} points\n\n` +
+        `Change them with /setwelcome, /setreferral, /setunlock, /setminwithdraw. Send /admin for all commands.`
+    );
+    return true;
+  }
+
+  const setter = SET_COMMANDS[cmd];
+  if (setter) {
+    if (!/^\d+$/.test(args) || Number(args) < setter.min) {
+      await reply(`Usage: /${cmd} N (a whole number, ${setter.min} or more)`);
+      return true;
+    }
+    await run(env, 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', SETTING_KEYS[setter.key], args);
+    settingsCache = null;
+    await reply(`✅ ${setter.label} is now ${Number(args)}. It applies from now on.`);
+    return true;
+  }
+
+  if (cmd === 'unlock' || cmd === 'lock') {
+    const target = await findUser(env, args);
+    if (!target) {
+      await reply(`User not found. Usage: /${cmd} ID or @username`);
+      return true;
+    }
+    const on = cmd === 'unlock' ? 1 : 0;
+    await run(env, 'UPDATE users SET withdraw_unlocked = ? WHERE id = ?', on, target.id);
+    await reply(on ? `✅ ${nameOf(target)} can now withdraw without doing tasks.` : `🔒 Manual unlock removed for ${nameOf(target)}.`);
+    if (on) await safeSend(env, target.telegram_id, '✅ Your withdrawals have been unlocked. You can now withdraw from the 🏦 Withdraw button.');
+    return true;
+  }
+
+  if (cmd === 'user') {
+    const u = await findUser(env, args);
+    if (!u) {
+      await reply('User not found. Usage: /user ID or @username');
+      return true;
+    }
+    const s = await getSettings(env);
+    const { earned, unlocked } = await withdrawStatus(env, u, s);
+    const refs = await q1(env, 'SELECT COUNT(*) AS n FROM users WHERE referred_by = ? AND welcome_given = 1', u.id);
+    const why = Number(u.withdraw_unlocked) === 1 ? 'unlocked by admin' : earned >= s.unlock ? 'earned enough from tasks' : `needs ${s.unlock} task points`;
+    await reply(
+      `👤 ${nameOf(u)} (${u.country || 'no country yet'})\nTelegram ID: ${u.telegram_id}\nBalance: ${u.balance} points\n` +
+        `Task earnings: ${earned} points\nWithdrawals: ${unlocked ? 'unlocked' : 'locked'} (${why})\n` +
+        `Payment: ${u.payment_details ? `${u.payment_type} - ${u.payment_details}` : 'not added'}\nReferrals: ${refs.n}`
+    );
+    return true;
+  }
+
+  if (cmd === 'tasks') {
+    const rows = await qa(env, 'SELECT id, title, points, link FROM tasks WHERE is_active = 1 ORDER BY id LIMIT 50');
+    await reply(rows.length ? `📋 Active tasks\n\n${rows.map((t) => `#${t.id} ${t.title} - ${t.points} pts\n${t.link || ''}`).join('\n\n')}\n\nDelete one with /deltask ID` : 'No active tasks. Add one with /addtask.');
+    return true;
+  }
+
+  if (cmd === 'deltask') {
+    if (!/^\d+$/.test(args)) {
+      await reply('Usage: /deltask ID (see /tasks for the IDs)');
+      return true;
+    }
+    // Hidden, not erased, so submissions that are already waiting can still be approved or rejected.
+    const r = await run(env, 'UPDATE tasks SET is_active = 0 WHERE id = ? AND is_active = 1', Number(args));
+    await reply(r.meta.changes ? `✅ Task ${args} deleted. Users no longer see it. Pending submissions can still be approved or rejected.` : `Task ${args} was not found or is already deleted.`);
+    return true;
+  }
+
+  return false;
 }
 
 // ---------- Callbacks ----------
@@ -763,6 +921,13 @@ async function setup(env, url) {
   if (!env.BOT_TOKEN) return new Response('BOT_TOKEN is missing on this Worker.', { status: 500 });
   if (!env.DB) return new Response('The D1 binding named DB is missing on this Worker.', { status: 500 });
   await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
+  for (const sql of MIGRATIONS) {
+    try {
+      await env.DB.prepare(sql).run();
+    } catch (e) {
+      // The column already exists.
+    }
+  }
   const result = await tg(env, 'setWebhook', {
     url: `${url.origin}/webhook`,
     secret_token: secret,
