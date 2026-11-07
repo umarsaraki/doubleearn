@@ -9,9 +9,12 @@ database_name = "taskbot"
 database_id = "5b9b401f-ceec-4918-abec-b887514cb93f"
 
 [vars]
-ADMIN_ID = "7544805601,8552397401,6743313006,6985475108"
+ADMIN_ID = "8552397401"
 CHANNELS = "@DoubleEarnPay,@officialchannelpay"
 MIN_WITHDRAW = "50"
+
+[triggers]
+crons = ["* * * * *"]
 
 [observability]
 enabled = true
