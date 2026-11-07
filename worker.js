@@ -2,7 +2,7 @@
 // Bindings: DB (D1). Secrets: BOT_TOKEN, WEBHOOK_SECRET.
 // Variables: ADMIN_ID, CHANNELS (e.g. @channel1,@channel2), MIN_WITHDRAW (optional).
 
-const VERSION = '2026-11-08 admin-panel-promotions';
+const VERSION = '2026-11-08 admin-panel-promotions (auto-setup)';
 const DEFAULT_SETTINGS = { welcome: 50, referral: 20, unlock: 100, minWithdraw: 50 };
 const SETTING_KEYS = { welcome: 'welcome_bonus', referral: 'referral_bonus', unlock: 'unlock_earnings', minWithdraw: 'min_withdraw' };
 let settingsCache = null;
@@ -149,6 +149,10 @@ const SCHEMA = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`,
+];
+
+// Created after the migrations, because some of them use columns the migrations add.
+const INDEXES = [
   `CREATE INDEX IF NOT EXISTS idx_users_balance ON users (balance DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_users_referred ON users (referred_by)`,
   `CREATE INDEX IF NOT EXISTS idx_history_user ON history (user_id, id DESC)`,
@@ -604,6 +608,8 @@ async function onMessage(env, m) {
 
   const state = m.photo || text ? await getState(env, m.from.id) : null;
   if (state && state.kind === 'admin') return onAdminInput(env, m, text, state);
+  // An admin who sends "Title | Description | Link | Points" without /addtask still adds the task.
+  if (!state && text.split('|').length >= 4 && (await isAdmin(env, m.from.id))) return onAddTask(env, m, `/addtask ${text}`);
   if (m.photo) return onPhoto(env, m, state);
   if (text) return onText(env, m.from, text, state);
 }
@@ -727,7 +733,8 @@ async function onPhoto(env, m, pre) {
 async function onAddTask(env, m, text) {
   if (!(await isAdmin(env, m.from.id))) return;
   const parts = text.replace(/^\/addtask(@\w+)?\s*/i, '').split('|').map((p) => p.trim());
-  const points = Number(parts[3]);
+  const pm = (parts[3] || '').match(/^\d+/);
+  const points = pm ? Number(pm[0]) : NaN;
   if (parts.length < 4 || !parts[0] || !Number.isInteger(points) || points <= 0) {
     return send(env, m.from.id, 'Usage: /addtask Title | Description | Link | Points\nAdd | optional at the end if the username is not required.');
   }
@@ -1761,7 +1768,51 @@ async function rejectWithdrawal(env, cq, wId, ack) {
 }
 
 // ---------- Worker entry ----------
+// The database is upgraded automatically the first time a new version runs, so opening /setup is no longer needed after an update.
+const SCHEMA_VERSION = '2026-11-08-a';
+let schemaReady = false;
+
+async function applySchema(env) {
+  await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
+  for (const sql of MIGRATIONS) {
+    try {
+      await env.DB.prepare(sql).run();
+    } catch (e) {
+      // The column already exists.
+    }
+  }
+  await env.DB.batch(INDEXES.map((sql) => env.DB.prepare(sql)));
+  await run(env, `INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?)`, SCHEMA_VERSION);
+}
+
+async function ensureSchema(env) {
+  if (schemaReady) return;
+  let current = null;
+  try {
+    const r = await q1(env, `SELECT value FROM settings WHERE key = 'schema_version'`);
+    current = r ? r.value : null;
+  } catch (e) {
+    // The settings table does not exist yet.
+  }
+  if (current !== SCHEMA_VERSION) await applySchema(env);
+  schemaReady = true;
+}
+
+// Admins see the real error in Telegram. Normal users get a short friendly message.
+async function reportError(env, update, e) {
+  console.error('Handler error:', e);
+  const from = (update.message && update.message.from) || (update.callback_query && update.callback_query.from);
+  if (!from) return;
+  try {
+    const text = (await isAdmin(env, from.id)) ? `⚠️ Error: ${String(e && e.message).slice(0, 300)}` : 'Something went wrong. Please try again in a moment.';
+    await send(env, from.id, text);
+  } catch (x) {
+    // Nothing more to do.
+  }
+}
+
 async function handle(env, update) {
+  await ensureSchema(env);
   if (update.message) return onMessage(env, update.message);
   if (update.callback_query) return onCallback(env, update.callback_query);
 }
@@ -1776,14 +1827,8 @@ async function setup(env, url) {
   }
   if (!env.BOT_TOKEN) return new Response('BOT_TOKEN is missing on this Worker.', { status: 500 });
   if (!env.DB) return new Response('The D1 binding named DB is missing on this Worker.', { status: 500 });
-  await env.DB.batch(SCHEMA.map((sql) => env.DB.prepare(sql)));
-  for (const sql of MIGRATIONS) {
-    try {
-      await env.DB.prepare(sql).run();
-    } catch (e) {
-      // The column already exists.
-    }
-  }
+  await applySchema(env);
+  schemaReady = true;
   const result = await tg(env, 'setWebhook', {
     url: `${url.origin}/webhook`,
     secret_token: secret,
@@ -1808,7 +1853,7 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
       const update = await request.json();
-      ctx.waitUntil(handle(env, update).catch((e) => console.error('Handler error:', e)));
+      ctx.waitUntil(handle(env, update).catch((e) => reportError(env, update, e)));
       return new Response('ok');
     }
     return new Response(`DoubleEarn bot is running (version ${VERSION})`);
@@ -1816,6 +1861,6 @@ export default {
 
   // Cron trigger (every minute): sends the next batch of a running broadcast.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runBroadcastChunk(env).catch((e) => console.error('Broadcast error:', e)));
+    ctx.waitUntil(ensureSchema(env).then(() => runBroadcastChunk(env)).catch((e) => console.error('Broadcast error:', e)));
   },
 };
